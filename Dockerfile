@@ -15,7 +15,8 @@ FROM golang:1.25-alpine AS builder
 WORKDIR /src
 # ENV GOPROXY=https://goproxy.cn,direct
 RUN apk add --no-cache git
-COPY . .
+COPY main.go .
+COPY internal ./internal
 RUN go mod init scanner-nuclei \
  && go mod tidy \
  && CGO_ENABLED=0 GOOS=linux go build -o /out/scanner-nuclei .
@@ -23,6 +24,7 @@ RUN go mod init scanner-nuclei \
 FROM alpine:latest
 RUN apk add --no-cache ca-certificates tzdata git
 WORKDIR /app
+COPY nuclei-templates /root/nuclei-templates
 COPY --from=builder /out/scanner-nuclei /app/scanner-nuclei
 ENV DAST_CONFIG=/app/config/config.json \
     DAST_DB_USER=root \
