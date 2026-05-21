@@ -1,0 +1,19 @@
+id: local-flask
+
+info:
+  name: 两个请求关联逻辑判断 POC
+  author: Gemini
+  severity: info
+
+http:
+  - raw:
+      - |
+        GET /?name=admin HTTP/1.1
+        Host: {{Hostname}}
+
+    matchers:
+      - type: dsl
+        dsl:
+          - "contains(body_1, 'admin')"
+          - "status_code_1 == 200"
+        condition: and

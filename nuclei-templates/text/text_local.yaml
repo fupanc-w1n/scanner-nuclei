@@ -1,0 +1,21 @@
+id: multi-request-check2
+
+info:
+  name: 两个请求关联逻辑判断 POC
+  author: Gemini
+  severity: info
+
+http:
+  - raw:
+      - |
+        GET / HTTP/1.1
+        Host: {{Hostname}}
+
+    matchers-condition: and
+    matchers:
+      # 检查第一个请求的结果 (index 1)
+      - type: dsl
+        dsl:
+          - "contains(body_1, 'Hello I am your')"
+          - "status_code_1 == 200"
+        condition: and
