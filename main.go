@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -70,33 +71,49 @@ func main() {
 func handleNuclei(ctx context.Context, cfg *scannerconfig.Config, mc *scannerconfig.NucleiConfig,
 	mdb *mysqldb.DB, msg *worker.BusinessMessage) worker.HandlerResult {
 
-	// 查 HTTP/Web 服务目标
-	targets, err := mdb.QueryServiceTargets(ctx, msg.TaskID, msg.Hosts, []string{"http", "https", "http-proxy", "http-alt"})
+	log.Printf("nuclei task=%d part=%s hosts=%v", msg.TaskID, msg.TaskPartName, msg.Hosts)
+
+	// 查当前分片中 nmap 识别出的 HTTP/Web 服务目标。
+	targets, err := mdb.QueryHTTPServiceTargets(ctx, msg.TaskID, msg.TaskPartName, msg.Hosts)
 	if err != nil {
 		return worker.HandlerResult{Err: fmt.Errorf("query http targets: %w", err)}
 	}
 
+	if err := mdb.DeleteVulnerabilitiesForPart(ctx, msg.TaskID, msg.TaskPartName); err != nil {
+		return worker.HandlerResult{Err: fmt.Errorf("delete old vulnerabilities: %w", err)}
+	}
+	findings := 0
 	if len(targets) > 0 {
 		urls := make([]string, 0, len(targets))
 		for _, t := range targets {
 			urls = append(urls, fmt.Sprintf("%s:%d", t.Host, t.Port))
 		}
-		if err := runNucleiScan(ctx, msg.TaskID, msg.TaskPartName, urls, mc.TemplateIDs, mc.QPS, mdb); err != nil {
+		findings, err = runNucleiScan(ctx, msg.TaskID, msg.TaskPartName, urls, mc.TemplateIDs, mc.QPS, mdb)
+		if err != nil {
 			return worker.HandlerResult{Err: fmt.Errorf("nuclei scan: %w", err)}
 		}
 	}
+	log.Printf("nuclei task=%d part=%s service_targets=%d findings=%d", msg.TaskID, msg.TaskPartName, len(targets), findings)
 
+	if err := ctx.Err(); err != nil {
+		return worker.HandlerResult{Err: err}
+	}
 	if err := mdb.SetNucleiStatus(ctx, msg.TaskID, msg.TaskPartName, "completed"); err != nil {
 		return worker.HandlerResult{Err: err}
 	}
-	_, _ = mdb.MarkPartCompletedIfAllDone(ctx, msg.TaskID, msg.TaskPartName)
+	if _, err := mdb.MarkPartCompletedIfAllDone(ctx, msg.TaskID, msg.TaskPartName); err != nil {
+		return worker.HandlerResult{Err: err}
+	}
+	recordTaskEvent(ctx, mdb, msg.TaskID, "nuclei",
+		fmt.Sprintf("nuclei part completed: part=%s service_targets=%d findings=%d", msg.TaskPartName, len(targets), findings),
+		map[string]interface{}{"task_part_name": msg.TaskPartName, "service_targets": len(targets), "findings": findings})
 	return worker.HandlerResult{}
 }
 
 // runNucleiScan 复用 demo/DAST.md / rate.md 的实现:LoadTargets(targets, true),WithGlobalRateLimitCtx,WithTemplateFilters。
-func runNucleiScan(parentCtx context.Context, taskID uint64, partName string, targets []string, templateIDs []string, qps int, mdb *mysqldb.DB) error {
+func runNucleiScan(parentCtx context.Context, taskID uint64, partName string, targets []string, templateIDs []string, qps int, mdb *mysqldb.DB) (int, error) {
 	if len(targets) == 0 {
-		return nil
+		return 0, nil
 	}
 	ctx, cancel := context.WithTimeout(parentCtx, 30*time.Minute)
 	defer cancel()
@@ -115,16 +132,25 @@ func runNucleiScan(parentCtx context.Context, taskID uint64, partName string, ta
 
 	engine, err := nuclei.NewNucleiEngineCtx(ctx, opts...)
 	if err != nil {
-		return fmt.Errorf("create engine: %w", err)
+		return 0, fmt.Errorf("create engine: %w", err)
 	}
 	defer engine.Close()
 	if err := engine.LoadAllTemplates(); err != nil {
-		return fmt.Errorf("load templates: %w", err)
+		return 0, fmt.Errorf("load templates: %w", err)
 	}
 	engine.LoadTargets(targets, true)
 
-	return engine.ExecuteCallbackWithCtx(ctx, func(ev *output.ResultEvent) {
+	var mu sync.Mutex
+	var firstErr error
+	findings := 0
+	err = engine.ExecuteCallbackWithCtx(ctx, func(ev *output.ResultEvent) {
 		if ev == nil || !ev.MatcherStatus {
+			return
+		}
+		mu.Lock()
+		skip := firstErr != nil
+		mu.Unlock()
+		if skip {
 			return
 		}
 		sev := ev.Info.SeverityHolder.Severity.String()
@@ -132,7 +158,7 @@ func runNucleiScan(parentCtx context.Context, taskID uint64, partName string, ta
 			sev = "unknown"
 		}
 		raw, _ := json.Marshal(ev)
-		_ = mdb.InsertVulnerability(context.Background(), mysqldb.Vulnerability{
+		if err := mdb.InsertVulnerability(ctx, mysqldb.Vulnerability{
 			TaskID:       taskID,
 			TaskPartName: partName,
 			Host:         ev.Host,
@@ -144,8 +170,26 @@ func runNucleiScan(parentCtx context.Context, taskID uint64, partName string, ta
 			Request:      ev.Request,
 			Response:     ev.Response,
 			RawEventJSON: string(raw),
-		})
+		}); err != nil {
+			mu.Lock()
+			if firstErr == nil {
+				firstErr = err
+			}
+			mu.Unlock()
+			return
+		}
+		mu.Lock()
+		findings++
+		mu.Unlock()
 	})
+	if err != nil {
+		return findings, err
+	}
+	mu.Lock()
+	err = firstErr
+	n := findings
+	mu.Unlock()
+	return n, err
 }
 
 func envOr(k, def string) string {
@@ -153,4 +197,10 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func recordTaskEvent(ctx context.Context, mdb *mysqldb.DB, taskID uint64, module, message string, meta map[string]interface{}) {
+	if err := mdb.InsertTaskEvent(ctx, taskID, "info", module, message, meta); err != nil {
+		log.Printf("%s task=%d event insert err=%v", module, taskID, err)
+	}
 }

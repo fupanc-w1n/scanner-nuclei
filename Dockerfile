@@ -6,7 +6,7 @@
 # Pod 运行时支持下列环境变量(K8s Deployment 可通过 env 字段覆盖):
 #   DAST_CONFIG       默认 /app/config/config.json   ConfigMap 挂载点
 #   DAST_DB_USER      默认 root                       MySQL 账号
-#   DAST_DB_PASS      默认 root                       MySQL 密码
+#   DAST_DB_PASS      代码默认 root                   MySQL 密码,可通过 ENV 覆盖
 #   DAST_DB_NAME      默认 dast                       MySQL 数据库
 #   DAST_REDIS_PASS   默认 redis                      Redis 密码(为空表示无密码)
 # MySQL/Redis 地址、端口由 ConfigMap 中的 scheduler.internal_ip / mysql_port / redis_port 决定。
@@ -30,5 +30,6 @@ ENV DAST_CONFIG=/app/config/config.json \
     DAST_DB_USER=root \
     DAST_DB_PASS=fupanC@123 \
     DAST_DB_NAME=dast \
-    DAST_REDIS_PASS=redis
+    DAST_REDIS_PASS=redis \
+    TZ=Asia/Shanghai
 ENTRYPOINT ["/app/scanner-nuclei"]
